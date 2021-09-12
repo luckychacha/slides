@@ -2,6 +2,9 @@
 
 pub use pallet::*;
 
+#[cfg(test)]
+mod tests;
+
 #[frame_support::pallet]
 pub mod pallet {
 	//! A demonstration of an offchain worker that sends onchain callbacks
@@ -17,24 +20,17 @@ pub mod pallet {
 	};
 	use sp_core::{crypto::KeyTypeId};
 	use sp_arithmetic::per_things::Permill;
-	use sp_runtime::{
-		offchain as rt_offchain,
+	use sp_runtime::{RuntimeDebug, offchain as rt_offchain,
+		offchain::{storage::StorageValueRef, storage_lock::{BlockAndTime, StorageLock}},
 		traits::{
 			BlockNumberProvider
-		},
-		offchain::{
-			storage::StorageValueRef,
-			storage_lock::{BlockAndTime, StorageLock},
-		},
-		transaction_validity::{
+		}, transaction_validity::{
 			InvalidTransaction, TransactionSource, TransactionValidity, ValidTransaction,
-		},
-		RuntimeDebug,
-	};
+		}};
 	use sp_std::{collections::vec_deque::VecDeque, prelude::*, str};
 
 	use serde::{Deserialize, Deserializer};
-
+	use serde_json::Value;
 	/// Defines application identifier for crypto keys of this module.
 	///
 	/// Every module that deals with signatures needs to declare its unique identifier for
@@ -50,6 +46,8 @@ pub mod pallet {
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
 	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
 	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
+
+	const DOT_PRICE_QUERY_URL: &str = "https://api.coincap.io/v2/assets/polkadot";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -96,6 +94,19 @@ pub mod pallet {
 		}
 	}
 
+
+	#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
+	pub struct DotPayload<Public> {
+		price: PolkadotPrice,
+		public: Public,
+	}
+
+	impl<T: SigningTypes> SignedPayload<T> for DotPayload<T::Public> {
+		fn public(&self) -> T::Public {
+			self.public.clone()
+		}
+	}
+
 	// ref: https://serde.rs/container-attrs.html#crate
 	#[derive(Deserialize, Encode, Decode, Default)]
 	struct GithubInfo {
@@ -107,6 +118,14 @@ pub mod pallet {
 		public_repos: u32,
 	}
 
+	pub type PolkadotPrice = (u64, Permill);
+
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct PolkadotPriceInfo {
+		#[serde(deserialize_with = "de_dot_price_string_to_tuple")]
+		price: PolkadotPrice,
+	}
+
 	#[derive(Debug, Deserialize, Encode, Decode, Default)]
 	struct IndexingData(Vec<u8>, u64);
 
@@ -116,6 +135,21 @@ pub mod pallet {
 	{
 		let s: &str = Deserialize::deserialize(de)?;
 		Ok(s.as_bytes().to_vec())
+	}
+
+	pub fn de_dot_price_string_to_tuple<'de, D>(de: D) -> Result<PolkadotPrice, D::Error>
+	where
+	D: Deserializer<'de>,
+	{
+		let s: &str = Deserialize::deserialize(de)?;
+		Ok(transfer_price_str_to_price_tuple(s))
+	}
+
+	pub fn transfer_price_str_to_price_tuple(price_str: &str) -> PolkadotPrice {
+		let price_parts: Vec<&str> = price_str.split(".").collect();
+		let left_part: u64 = price_parts[0].parse::<u64>().unwrap();
+		let right_part: Permill = Permill::from_parts(price_parts[1][0..6].parse::<u32>().unwrap());
+		(left_part, right_part)
 	}
 
 	impl fmt::Debug for GithubInfo {
@@ -162,6 +196,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		NewPrice(Option<T::AccountId>, PolkadotPrice),
 	}
 
 	// Errors inform users that something went wrong.
@@ -213,6 +248,14 @@ pub mod pallet {
 				4 => Self::fetch_price_info(),
 				_ => Err(Error::<T>::UnknownOffchainMux),
 			};
+			// let result = match modu {
+			// 	0 => Ok(()),
+			// 	1 => Ok(()),
+			// 	2 => Ok(()),
+			// 	3 => Ok(()),
+			// 	4 => Self::fetch_price_info(),
+			// 	_ => Err(Error::<T>::UnknownOffchainMux),
+			// };
 
 			if let Err(e) = result {
 				log::error!("offchain_worker error: {:?}", e);
@@ -242,6 +285,12 @@ pub mod pallet {
 			match call {
 				Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
 				Call::submit_number_unsigned_with_signed_payload(ref payload, ref signature) => {
+					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
+						return InvalidTransaction::BadProof.into();
+					}
+					valid_tx(b"submit_number_unsigned_with_signed_payload".to_vec())
+				},
+				Call::submit_dot_price_unsigned_with_signed_payload(ref payload, ref signature) => {
 					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
 						return InvalidTransaction::BadProof.into();
 					}
@@ -288,6 +337,20 @@ pub mod pallet {
 			Self::deposit_event(Event::NewNumber(None, number));
 			Ok(())
 		}
+
+		#[pallet::weight(10000)]
+		pub fn submit_dot_price_unsigned_with_signed_payload(origin: OriginFor<T>, payload: DotPayload<T::Public>, _signature: T::Signature) -> DispatchResult
+		{
+			let _ = ensure_none(origin)?;
+			// we don't need to verify the signature here because it has been verified in
+			//   `validate_unsigned` function when sending out the unsigned tx.
+			let DotPayload { price, public } = payload;
+			log::info!("submit_price_unsigned_with_signed_payload: ({:#?}, {:?})", price, public);
+			Self::append_or_replace_price(price);
+
+			Self::deposit_event(Event::NewPrice(None, price));
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -303,6 +366,16 @@ pub mod pallet {
 			});
 		}
 
+		fn append_or_replace_price(price: (u64, Permill)) {
+			Prices::<T>::mutate(|prices| {
+				if prices.len() == NUM_VEC_LEN {
+					let _ = prices.pop_front();
+				}
+				prices.push_back(price);
+				log::info!("Price vector: {:?}", prices);
+			})
+		}
+
 		fn fetch_price_info() -> Result<(), Error<T>> {
 			// TODO: 这是你们的功课
 
@@ -315,8 +388,82 @@ pub mod pallet {
 
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
+			
+			// 我选择使用：不签名但具签名信息的交易提交回链上。
+			// 原因：对数据签名可以验证这笔交易的来源，但是不需要该用户支付手续费，所以选择这种方式提交回链上。
+			// 代码流程简述：
+			// 1.fetch_dot_price_n_parse：通过 http 请求获取网站获取到 dot 价格的 json 数据，从中取出需要的部分：dot 的价格，并将其转换成要求的格式： (u64, Permill)，价格的整数部分为 u64，小数部分只取前 6 位小数，因为小数部分选取的是 Permill，六位小数作为一个 u32除以百万【1000000】。
+			// 2.submit_dot_price_unsigned_with_signed_payload：将得到的 dot 价格进行提交。
+			let mut lock = StorageLock::<BlockAndTime<Self>>::with_block_and_time_deadline(
+				b"offchain-demo-dot-price::lock",
+				LOCK_BLOCK_EXPIRATION,
+				rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION)
+			);
+			if let Ok(_guard) = lock.try_lock() {
+				match Self::fetch_dot_price_n_parse() {
+					Ok(price) => {
+						let _ = Self::offchain_unsigned_tx_signed_dot_price_payload(price);
+					}
+					Err(err) => {
+						return Err(err);
+					}
+				}
+			}
+
 
 			Ok(())
+		}
+
+		fn fetch_dot_price_n_parse() -> Result<PolkadotPrice, Error<T>> {
+			let body_bytes = Self::fetch_dot_price().map_err(|e| {
+				log::error!("fetch from remote error:{:?}", e);
+				Error::<T>::HttpFetchingError
+			})?;
+
+			let body_str = str::from_utf8(&body_bytes).map_err(|_| {
+				Error::<T>::HttpFetchingError
+			})?;
+
+			let v: Value = serde_json::from_str(&body_str).map_err(|_| {
+				Error::<T>::HttpFetchingError
+			})?;
+
+			log::info!("the newest price of dot is: {}", v["data"]["priceUsd"]);
+
+			let dot_price = transfer_price_str_to_price_tuple(
+				v["data"]["priceUsd"].as_str().unwrap()
+			);
+			Ok(dot_price)
+		}
+
+		fn fetch_dot_price() -> Result<Vec<u8>, Error<T>> {
+			log::info!("sending request to: {}", DOT_PRICE_QUERY_URL);
+			
+			// set request url.
+			let request = rt_offchain::http::Request::get(DOT_PRICE_QUERY_URL);
+
+			// set request timeout.
+			let deadline_timestamp = sp_io::offchain::timestamp()
+				.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+			
+			let pending = request
+				.deadline(deadline_timestamp)
+				.send()
+				.map_err(|_| {
+					Error::<T>::HttpFetchingError
+				})?;
+			
+			let response = pending
+				.try_wait(deadline_timestamp)
+				.map_err(|_| <Error<T>>::HttpFetchingError)?
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			if response.code != 200 {
+				log::error!("unexpected http code: {}", response.code);
+				return Err(Error::<T>::HttpFetchingError);
+			}
+
+			Ok(response.body().collect::<Vec<u8>>())
 		}
 
 
@@ -492,6 +639,30 @@ pub mod pallet {
 
 			// The case of `None`: no account is available for sending
 			log::error!("No local account available");
+			Err(<Error<T>>::NoLocalAcctForSigning)
+		}
+
+		fn offchain_unsigned_tx_signed_dot_price_payload(price: PolkadotPrice) -> Result<(), Error<T>> {
+			// Retrieve the signer to sign the payload
+			let signer = Signer::<T, T::AuthorityId>::any_account();
+
+			// `send_unsigned_transaction` is returning a type of `Option<(Account<T>, Result<(), ()>)>`.
+			//   Similar to `send_signed_transaction`, they account for:
+			//   - `None`: no account is available for sending transaction
+			//   - `Some((account, Ok(())))`: transaction is successfully sent
+			//   - `Some((account, Err(())))`: error occured when sending the transaction
+			if let Some((_, res)) = signer.send_unsigned_transaction(
+				|acct| DotPayload { price, public: acct.public.clone() },
+				Call::submit_dot_price_unsigned_with_signed_payload
+				) {
+				return res.map_err(|_| {
+					log::error!("Failed in offchain_unsigned_tx_signed_dot_price_payload");
+					<Error<T>>::OffchainUnsignedTxSignedPayloadError
+				});
+			}
+
+			// The case of `None`: no account is available for sending
+			log::error!("No local account available[dot]");
 			Err(<Error<T>>::NoLocalAcctForSigning)
 		}
 	}
